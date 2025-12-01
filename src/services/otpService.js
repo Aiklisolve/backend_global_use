@@ -1,57 +1,86 @@
 import { query } from '../config/db.js';
 import { config } from '../config/env.js';
 import { v4 as uuidv4 } from 'uuid';
-import moment from "moment-timezone";
+import moment from 'moment-timezone';
+import { sendOtpViaSMS, sendOtpViaEmail } from './notificationService.js';
+
 function generateOtp() {
   // 4-digit OTP
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
 
-
-export async function createOtpForUser(user, explicitMobile) {
+/**
+ * Create OTP for user and send via SMS/Email
+ */
+export async function createOtpForUser(user, explicitMobile, otpType = 'LOGIN') {
   const otpCode = generateOtp();
   const ttl = Number(config.otp.ttlMinutes || 30);
 
-const nowIST = moment().tz("Asia/Kolkata");
+  const timezone = config.timezone || 'Asia/Kolkata';
+  const nowLocal = moment().tz(timezone);
 
-// EXPIRY in IST (+TTL minutes)
-const expiresIST = nowIST.clone().add(ttl, "minutes");
+  // EXPIRY in local timezone (+TTL minutes)
+  const expiresLocal = nowLocal.clone().add(ttl, 'minutes');
 
-// Convert IST → UTC DATE OBJECT for Postgres
-const expiresUTC = expiresIST.tz("UTC").toDate();
-
-// For logs only (optional)
-// console.log("NOW IST       =", nowIST.format("DD/MM/YYYY HH:mm:ss"));
-// console.log("EXPIRES IST   =", expiresIST.format("DD/MM/YYYY HH:mm:ss"));
-// console.log("EXPIRES UTC   =", expiresUTC.toISOString());
-
+  // Convert local timezone → UTC DATE OBJECT for Postgres
+  const expiresUTC = expiresLocal.tz('UTC').toDate();
 
   const mobile = explicitMobile || user.phone;
+  const email = user.email;
 
+  // Insert OTP into database
   const sql = `
-    insert into users_otps
+    INSERT INTO users_otps
       (user_id, phone, otp_code, otp_type,
        expires_at, is_used, attempts_count, email, ip_address)
-    values
-      ($1, $2, $3, 'LOGIN', $4,
-       false, 0, $5, $6)
-    returning *;
+    VALUES
+      ($1, $2, $3, $4, $5,
+       false, 0, $6, $7)
+    RETURNING *;
   `;
 
   const { rows } = await query(sql, [
     user.user_id,
     mobile,
     otpCode,
-    expiresUTC,   // store UTC timestamp
-    user.email,
-    "127.0.0.1"
+    otpType,
+    expiresUTC, // store UTC timestamp
+    email,
+    '127.0.0.1',
   ]);
+
+  // Send OTP via SMS and/or Email
+  const sendPromises = [];
+
+  // Send SMS if mobile number is available
+  if (mobile) {
+    sendPromises.push(
+      sendOtpViaSMS(mobile, otpCode, otpType).catch((error) => {
+        console.error(`Failed to send OTP SMS to ${mobile}:`, error.message);
+        // Don't throw - continue even if SMS fails
+      })
+    );
+  }
+
+  // Send Email if email is available
+  if (email) {
+    sendPromises.push(
+      sendOtpViaEmail(email, otpCode, otpType).catch((error) => {
+        console.error(`Failed to send OTP Email to ${email}:`, error.message);
+        // Don't throw - continue even if Email fails
+      })
+    );
+  }
+
+  // Wait for all notifications to complete (but don't fail if they error)
+  await Promise.allSettled(sendPromises);
 
   return {
     otpCode,
-    expiresIST: expiresIST.format("DD/MM/YYYY HH:mm:ss"),
+    expiresIST: expiresLocal.format('DD/MM/YYYY HH:mm:ss'), // Keep field name for backward compatibility
+    expiresLocal: expiresLocal.format('DD/MM/YYYY HH:mm:ss'),
     expiresUTC,
-    row: rows[0]
+    row: rows[0],
   };
 }
 
@@ -71,8 +100,9 @@ export async function verifyUserOtp(userId, mobile, otp) {
 
   const row = rows[0];
 
-  const nowIST = moment().tz("Asia/Kolkata");
-  const expiresIST = moment(row.expires_at).tz("Asia/Kolkata");
+  const timezone = config.timezone || 'Asia/Kolkata';
+  const nowLocal = moment().tz(timezone);
+  const expiresLocal = moment(row.expires_at).tz(timezone);
 
   // console.log("NOW IST       =", nowIST.format("DD/MM/YYYY HH:mm:ss"));
   // console.log("EXPIRES IST   =", expiresIST.format("DD/MM/YYYY HH:mm:ss"));
@@ -80,7 +110,7 @@ export async function verifyUserOtp(userId, mobile, otp) {
 // console.log('otp',otp);
 
   if (row.is_used) return { valid: false, reason: "otp_used" };
-  if (nowIST.isAfter(expiresIST)) return { valid: false, reason: "otp_expired" };
+  if (nowLocal.isAfter(expiresLocal)) return { valid: false, reason: "otp_expired" };
 if (String(row.otp_code).trim() !== String(otp).trim()) {
   return { valid: false, reason: "otp_mismatch" };
 }
